@@ -156,6 +156,57 @@ def create_event(
     return _safe(run)
 
 
+@mcp.tool()
+def list_objects(calendar: str | None = None) -> dict:
+    """List every event on one calendar, including each event's `uid`.
+
+    `list_events` reads the aggregated Shell agenda, which carries no UIDs, so
+    use this when you need a target for `update_event` / `delete_event`. Pass a
+    calendar display name, or omit it for the default write calendar.
+    """
+
+    def run():
+        objs = gcal.list_objects(calendar)
+        return {"event_count": len(objs), "events": objs}
+
+    return _safe(run)
+
+
+@mcp.tool()
+def update_event(
+    uid: str,
+    summary: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    calendar: str | None = None,
+) -> dict:
+    """Edit an existing event's summary, description or location, in place.
+
+    `uid` comes from `list_objects`. Only the fields you pass are changed.
+    Times are not editable — delete and re-create for a reschedule. Confirm the
+    intended edit with the user before calling.
+    """
+
+    def run():
+        return gcal.update_event(calendar, uid, summary, description, location)
+
+    return _safe(run)
+
+
+@mcp.tool()
+def delete_event(uid: str, calendar: str | None = None, confirm: bool = False) -> dict:
+    """Delete one event, identified by `uid` from `list_objects`.
+
+    Destructive and irreversible. `confirm` must be True, and only after the user
+    has explicitly agreed to this specific deletion — never infer consent.
+    """
+
+    def run():
+        return gcal.delete_event(calendar, uid, confirm)
+
+    return _safe(run)
+
+
 def main() -> None:
     mcp.run()
 

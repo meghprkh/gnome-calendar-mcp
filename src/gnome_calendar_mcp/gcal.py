@@ -421,6 +421,106 @@ def create_event(summary, start, end=None, all_day=False, location=None,
     return {"uid": uids[0] if uids else fallback_uid, "calendar": cal.name, "backend": cal.backend}
 
 
+# `ModifyObjects`/`RemoveObjects` take an ECalObjModType *name*. An empty string
+# is accepted by the D-Bus layer — you get a clean `method_return` and no error —
+# but EDS then does nothing at all, which looks exactly like a backend rejection.
+# "THIS" is the correct value for a single (non-recurring) component.
+_MOD_THIS = "THIS"
+
+
+def _open_calendar(conn, uid: str) -> DBusAddress:
+    """Open a calendar client and make sure its backend is loaded."""
+    obj, bus_name = _call(conn, _factory(conn), "OpenCalendar", "s", (uid,))
+    addr = DBusAddress(obj, bus_name=bus_name, interface=_CAL_IFACE)
+    try:
+        _call(conn, addr, "Open")  # Writable and the object cache are only valid once open
+    except RuntimeError:
+        pass
+    return addr
+
+
+def _ics_uid(ics: str) -> str | None:
+    for line in ics.replace("\r\n", "\n").split("\n"):
+        if line.startswith("UID:"):
+            return line[4:].strip()
+    return None
+
+
+def _parse_object(ics: str) -> dict:
+    ev = ICalEvent.from_ical(ics)
+    start = ev.decoded("DTSTART")
+    end = ev.decoded("DTEND") if ev.get("DTEND") else None
+    return {
+        "uid": str(ev.get("UID", "")),
+        "summary": str(ev.get("SUMMARY", "(untitled)")),
+        "start": start.isoformat() if hasattr(start, "isoformat") else str(start),
+        "end": end.isoformat() if hasattr(end, "isoformat") else str(end),
+        # DTSTART is a bare DATE (not datetime) for all-day events.
+        "all_day": not isinstance(start, datetime),
+        "description": str(ev.get("DESCRIPTION")) if ev.get("DESCRIPTION") else None,
+        "location": str(ev.get("LOCATION")) if ev.get("LOCATION") else None,
+    }
+
+
+def _raw_objects(conn, cal_addr) -> list[str]:
+    body = _call(conn, cal_addr, "GetObjectList", "s", ("",))
+    objs = body[0] if body else []
+    return [o for o in objs if isinstance(o, str) and "BEGIN:VEVENT" in o]
+
+
+def list_objects(calendar: str | None = None) -> list[dict]:
+    """Every event on one calendar, including its UID.
+
+    The Shell CalendarServer we read the agenda from does not expose UIDs, so
+    update/delete targets have to come from here.
+    """
+    cal = resolve_calendar(calendar)
+    with open_dbus_connection(bus=_session_bus_address()) as conn:
+        cal_addr = _open_calendar(conn, cal.uid)
+        raw = _raw_objects(conn, cal_addr)
+    return [_parse_object(ics) for ics in raw]
+
+
+def update_event(calendar=None, uid=None, summary=None, description=None, location=None) -> dict:
+    """Edit the summary/description/location of an existing event in place.
+
+    Times are deliberately not editable here: rewriting DTSTART/DTEND means
+    re-deriving duration and all-day-ness, and a delete+recreate is safer.
+    """
+    if not uid:
+        raise RuntimeError("update_event needs the event's UID (see list_objects).")
+    cal = resolve_calendar(calendar)
+    with open_dbus_connection(bus=_session_bus_address()) as conn:
+        cal_addr = _open_calendar(conn, cal.uid)
+        match = next((ics for ics in _raw_objects(conn, cal_addr) if _ics_uid(ics) == uid), None)
+        if match is None:
+            raise RuntimeError(f"No event with UID {uid!r} on {cal.name!r}.")
+        ev = ICalEvent.from_ical(match)
+        if summary is not None:
+            ev["SUMMARY"] = summary
+        if description is not None:
+            ev["DESCRIPTION"] = description
+        if location is not None:
+            ev["LOCATION"] = location
+        _call(conn, cal_addr, "ModifyObjects", "assu", ([ev.to_ical().decode("utf-8")], _MOD_THIS, 0))
+    return {"updated": True, "uid": uid, "calendar": cal.name, "backend": cal.backend}
+
+
+def delete_event(calendar=None, uid=None, confirm: bool = False) -> dict:
+    """Delete one event by UID. Refuses unless `confirm` is truthy."""
+    if not uid:
+        raise RuntimeError("delete_event needs the event's UID (see list_objects).")
+    if not confirm:
+        raise RuntimeError("Refusing to delete without confirm=True.")
+    cal = resolve_calendar(calendar)
+    with open_dbus_connection(bus=_session_bus_address()) as conn:
+        cal_addr = _open_calendar(conn, cal.uid)
+        if not any(_ics_uid(ics) == uid for ics in _raw_objects(conn, cal_addr)):
+            raise RuntimeError(f"No event with UID {uid!r} on {cal.name!r}.")
+        _call(conn, cal_addr, "RemoveObjects", "a(ss)su", ([(uid, "")], _MOD_THIS, 0))
+    return {"deleted": True, "uid": uid, "calendar": cal.name, "backend": cal.backend}
+
+
 if __name__ == "__main__":
     # Smoke test: list calendars, then print the next week's agenda.
     print("Calendars:")
